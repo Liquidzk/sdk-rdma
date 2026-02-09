@@ -1,0 +1,4 @@
+[submodule "aws-sdk-go-v2"]
+	path = aws-sdk-go-v2
+	url = https://github.com/aws/aws-sdk-go-v2.git
+	branch = main

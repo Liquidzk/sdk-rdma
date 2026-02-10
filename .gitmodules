@@ -1,4 +1,4 @@
 [submodule "aws-sdk-go-v2"]
 	path = aws-sdk-go-v2
-	url = https://github.com/aws/aws-sdk-go-v2.git
-	branch = main
+	url = git@github.com:Liquidzk/aws-sdk-go-v2.git
+	branch = s3-rdma

@@ -12,34 +12,39 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	awsrdmahttp "github.com/aws/aws-sdk-go-v2/aws/transport/http/rdma"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	smithy "github.com/aws/smithy-go"
 )
 
-// RDMAHTTPClient is the transport hook point. Replace DialContext with your RDMA-backed dialer.
-type RDMAHTTPClient struct {
-	inner *http.Client
-}
-
-func (c *RDMAHTTPClient) Do(req *http.Request) (*http.Response, error) {
-	return c.inner.Do(req)
-}
-
 func main() {
 	var (
-		endpoint     string
-		region       string
-		bucket       string
-		key          string
-		mode         string
-		putFile      string
-		payload      string
-		getOut       string
-		autoMkBucket bool
+		endpoint            string
+		region              string
+		bucket              string
+		key                 string
+		mode                string
+		putFile             string
+		payload             string
+		getOut              string
+		requestTimeout      time.Duration
+		count               int
+		concurrency         int
+		autoMkBucket        bool
+		enableRDMA          bool
+		disableRDMAFallback bool
+		rdmaFramePayload    int
+		rdmaSendQueueDepth  int
+		rdmaRecvQueueDepth  int
+		rdmaInlineThreshold int
+		rdmaOpenParallelism int
+		rdmaOpenInterval    time.Duration
 	)
 
 	flag.StringVar(&endpoint, "endpoint", getenv("S3_PROXY_ENDPOINT", "http://127.0.0.1:18080"), "S3 base endpoint (relay server)")
@@ -50,27 +55,62 @@ func main() {
 	flag.StringVar(&putFile, "put-file", "", "upload from local file instead of -payload")
 	flag.StringVar(&payload, "payload", "hello from rdma-http-demo", "payload when -put-file is empty")
 	flag.StringVar(&getOut, "get-out", "", "write GetObject response to file (default stdout)")
+	flag.DurationVar(&requestTimeout, "request-timeout", 30*time.Second, "timeout for each S3 API call (0 disables timeout)")
+	flag.IntVar(&count, "count", 1, "number of operations to execute in this process")
+	flag.IntVar(&concurrency, "concurrency", 1, "worker concurrency when -count > 1")
 	flag.BoolVar(&autoMkBucket, "ensure-bucket", true, "create bucket if not found")
+	flag.BoolVar(&enableRDMA, "rdma", true, "enable SDK RDMA transport dialer")
+	flag.BoolVar(&disableRDMAFallback, "rdma-disable-fallback", false, "disable TCP fallback when RDMA open fails")
+	flag.IntVar(&rdmaFramePayload, "rdma-frame-payload", 0, "RDMA frame payload bytes (0 uses SDK defaults)")
+	flag.IntVar(&rdmaSendQueueDepth, "rdma-sendq", 0, "RDMA send queue depth (0 uses SDK defaults)")
+	flag.IntVar(&rdmaRecvQueueDepth, "rdma-recvq", 0, "RDMA recv queue depth (0 uses SDK defaults)")
+	flag.IntVar(&rdmaInlineThreshold, "rdma-inline", 0, "RDMA inline threshold bytes (0 uses SDK defaults)")
+	flag.IntVar(&rdmaOpenParallelism, "rdma-open-parallelism", awsrdmahttp.DefaultOpenParallelism, "max concurrent RDMA open attempts (0 disables limit)")
+	flag.DurationVar(&rdmaOpenInterval, "rdma-open-interval", awsrdmahttp.DefaultOpenMinInterval, "minimum interval between RDMA open attempts (0 disables spacing)")
 	flag.Parse()
+
+	if count < 1 {
+		log.Fatalf("invalid -count %d, must be >= 1", count)
+	}
+	if concurrency < 1 {
+		log.Fatalf("invalid -concurrency %d, must be >= 1", concurrency)
+	}
+	if rdmaOpenParallelism < 0 {
+		log.Fatalf("invalid -rdma-open-parallelism %d, must be >= 0", rdmaOpenParallelism)
+	}
+	if rdmaOpenInterval < 0 {
+		log.Fatalf("invalid -rdma-open-interval %s, must be >= 0", rdmaOpenInterval)
+	}
 
 	accessKey, secretKey, sessionToken, err := loadCredentialsFromEnv()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	rdmaDial := (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext
-	httpClient := &RDMAHTTPClient{
-		inner: &http.Client{
-			Transport: &http.Transport{
-				Proxy:                 http.ProxyFromEnvironment,
-				DialContext:           rdmaDial,
-				MaxIdleConns:          512,
-				MaxIdleConnsPerHost:   256,
-				IdleConnTimeout:       90 * time.Second,
-				ExpectContinueTimeout: 1 * time.Second,
-				ForceAttemptHTTP2:     false,
-			},
-		},
+	httpClient := awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
+		tr.Proxy = http.ProxyFromEnvironment
+		tr.MaxIdleConns = 512
+		tr.MaxIdleConnsPerHost = 256
+		tr.IdleConnTimeout = 90 * time.Second
+		tr.ExpectContinueTimeout = 1 * time.Second
+		tr.ForceAttemptHTTP2 = false
+	})
+	if requestTimeout > 0 {
+		httpClient = httpClient.WithTimeout(requestTimeout)
+	}
+
+	closeHTTPClient := func() {
+		httpClient.CloseIdleConnections()
+	}
+	defer closeHTTPClient()
+
+	fail := func(err error) {
+		closeHTTPClient()
+		log.Fatal(err)
+	}
+	failf := func(format string, args ...interface{}) {
+		closeHTTPClient()
+		log.Fatalf(format, args...)
 	}
 
 	ctx := context.Background()
@@ -82,38 +122,94 @@ func main() {
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, sessionToken)),
 	)
 	if err != nil {
-		log.Fatalf("load config failed: %v", err)
+		failf("load config failed: %v", err)
 	}
+
+	fallbackDial := (&net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
 
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
 		o.UsePathStyle = true
 		o.RetryMaxAttempts = 3
+		if !enableRDMA {
+			return
+		}
+
+		rdmaDialer := awsrdmahttp.NewVerbsDialer(awsrdmahttp.VerbsOptions{
+			FramePayloadSize: rdmaFramePayload,
+			SendQueueDepth:   rdmaSendQueueDepth,
+			RecvQueueDepth:   rdmaRecvQueueDepth,
+			InlineThreshold:  rdmaInlineThreshold,
+		})
+		rdmaDialer.OpenParallelism = rdmaOpenParallelism
+		rdmaDialer.OpenMinInterval = rdmaOpenInterval
+		rdmaDialer.DisableFallback = disableRDMAFallback
+		rdmaDialer.FallbackDialContext = fallbackDial
+
+		o.EnableRDMATransport = true
+		o.RDMADialer = rdmaDialer
 	})
 
+	if enableRDMA {
+		log.Printf(
+			"RDMA transport enabled fallback=%t frame_payload=%d sendq=%d recvq=%d inline=%d open_parallelism=%d open_interval=%s request_timeout=%s count=%d concurrency=%d",
+			!disableRDMAFallback, rdmaFramePayload, rdmaSendQueueDepth, rdmaRecvQueueDepth, rdmaInlineThreshold, rdmaOpenParallelism, rdmaOpenInterval, requestTimeout, count, concurrency,
+		)
+	} else {
+		log.Printf("RDMA transport disabled; using plain TCP HTTP transport request_timeout=%s count=%d concurrency=%d", requestTimeout, count, concurrency)
+	}
+
 	if autoMkBucket {
-		if err := ensureBucket(ctx, client, bucket); err != nil {
-			log.Fatalf("ensure bucket %q failed: %v", bucket, err)
+		opCtx, cancel := withOpTimeout(ctx, requestTimeout)
+		err := ensureBucket(opCtx, client, bucket)
+		cancel()
+		if err != nil {
+			failf("ensure bucket %q failed: %v", bucket, err)
 		}
 	}
 
 	switch strings.ToLower(mode) {
 	case "put":
-		if err := runPut(ctx, client, bucket, key, putFile, payload); err != nil {
-			log.Fatal(err)
+		err := runBatch(count, concurrency, func(i int) error {
+			opCtx, cancel := withOpTimeout(ctx, requestTimeout)
+			defer cancel()
+			return runPut(opCtx, client, bucket, batchKey(key, i), putFile, payload)
+		})
+		if err != nil {
+			fail(err)
 		}
 	case "get":
-		if err := runGet(ctx, client, bucket, key, getOut); err != nil {
-			log.Fatal(err)
+		err := runBatch(count, concurrency, func(i int) error {
+			opCtx, cancel := withOpTimeout(ctx, requestTimeout)
+			defer cancel()
+			return runGet(opCtx, client, bucket, batchKey(key, i), getOut)
+		})
+		if err != nil {
+			fail(err)
 		}
 	case "both":
-		if err := runPut(ctx, client, bucket, key, putFile, payload); err != nil {
-			log.Fatal(err)
-		}
-		if err := runGet(ctx, client, bucket, key, getOut); err != nil {
-			log.Fatal(err)
+		err := runBatch(count, concurrency, func(i int) error {
+			k := batchKey(key, i)
+
+			opCtxPut, cancelPut := withOpTimeout(ctx, requestTimeout)
+			putErr := runPut(opCtxPut, client, bucket, k, putFile, payload)
+			cancelPut()
+			if putErr != nil {
+				return putErr
+			}
+
+			opCtxGet, cancelGet := withOpTimeout(ctx, requestTimeout)
+			getErr := runGet(opCtxGet, client, bucket, k, getOut)
+			cancelGet()
+			return getErr
+		})
+		if err != nil {
+			fail(err)
 		}
 	default:
-		log.Fatalf("invalid -mode %q, expected put|get|both", mode)
+		failf("invalid -mode %q, expected put|get|both", mode)
 	}
 }
 
@@ -251,4 +347,69 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func withOpTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return parent, func() {}
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
+func runBatch(count, concurrency int, fn func(index int) error) error {
+	if count == 1 {
+		return fn(1)
+	}
+
+	jobs := make(chan int)
+	errs := make(chan error, count)
+
+	var wg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				if err := fn(idx); err != nil {
+					errs <- fmt.Errorf("op %d failed: %w", idx, err)
+				}
+			}
+		}()
+	}
+
+	for i := 1; i <= count; i++ {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	close(errs)
+
+	var firstErr error
+	failCount := 0
+	for err := range errs {
+		if firstErr == nil {
+			firstErr = err
+		}
+		failCount++
+	}
+
+	if failCount > 0 {
+		return fmt.Errorf("batch finished with %d/%d failures: %w", failCount, count, firstErr)
+	}
+
+	log.Printf("batch finished successfully count=%d concurrency=%d", count, concurrency)
+	return nil
+}
+
+func batchKey(base string, index int) string {
+	if index <= 1 {
+		return base
+	}
+
+	dot := strings.LastIndex(base, ".")
+	slash := strings.LastIndex(base, "/")
+	if dot > slash {
+		return fmt.Sprintf("%s-%d%s", base[:dot], index, base[dot:])
+	}
+	return fmt.Sprintf("%s-%d", base, index)
 }

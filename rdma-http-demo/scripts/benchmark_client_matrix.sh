@@ -22,8 +22,8 @@ need_cmd sed
 need_cmd mktemp
 
 ENDPOINT="${ENDPOINT:-http://10.0.1.2:18080}"
-REQUESTS="${REQUESTS:-400}"
-CONCURRENCY_LIST="${CONCURRENCY_LIST:-1 2 4 8 16 32}"
+REQUESTS="${REQUESTS:-0}"
+CONCURRENCY_LIST="${CONCURRENCY_LIST:-0}"
 ROUNDS="${ROUNDS:-3}"
 ROUND_SLEEP_SEC="${ROUND_SLEEP_SEC:-0}"
 
@@ -32,6 +32,8 @@ REQUEST_TIMEOUT_HARD="${REQUEST_TIMEOUT_HARD:-120s}"
 ENSURE_BUCKET="${ENSURE_BUCKET:-false}"
 STRESS_MODE="${STRESS_MODE:-single-process}"
 INTER_REQUEST_SLEEP_MS="${INTER_REQUEST_SLEEP_MS:-0}"
+TARGET_RPS="${TARGET_RPS:-0}"
+RUN_DURATION="${RUN_DURATION:-10s}"
 
 RDMA="${RDMA:-true}"
 RDMA_DISABLE_FALLBACK="${RDMA_DISABLE_FALLBACK:-true}"
@@ -39,8 +41,10 @@ RDMA_FRAME_PAYLOAD="${RDMA_FRAME_PAYLOAD:-0}"
 RDMA_SENDQ="${RDMA_SENDQ:-0}"
 RDMA_RECVQ="${RDMA_RECVQ:-0}"
 RDMA_INLINE="${RDMA_INLINE:-0}"
-RDMA_OPEN_PARALLELISM="${RDMA_OPEN_PARALLELISM:-1}"
-RDMA_OPEN_INTERVAL="${RDMA_OPEN_INTERVAL:-200ms}"
+RDMA_LOW_CPU="${RDMA_LOW_CPU:-true}"
+RDMA_SEND_SIGNAL_INTERVAL="${RDMA_SEND_SIGNAL_INTERVAL:-0}"
+RDMA_OPEN_PARALLELISM="${RDMA_OPEN_PARALLELISM:-0}"
+RDMA_OPEN_INTERVAL="${RDMA_OPEN_INTERVAL:-0ms}"
 
 RESTART_REMOTE_RELAY="${RESTART_REMOTE_RELAY:-true}"
 REMOTE_HOST="${REMOTE_HOST:-}"
@@ -77,11 +81,11 @@ extract_metric() {
 }
 
 mkdir -p "$(dirname "${OUT_CSV}")"
-echo "timestamp,concurrency,round,exit_code,success,failed,success_ratio_pct,duration_s,success_qps,cpu_pct,user_s,sys_s,rss_kb,log_dir" >"${OUT_CSV}"
+echo "timestamp,target_rps,run_duration,concurrency,round,exit_code,success,failed,success_ratio_pct,duration_s,success_qps,cpu_pct,user_s,sys_s,rss_kb,log_dir" >"${OUT_CSV}"
 
 run_idx=0
 for conc in ${CONCURRENCY_LIST}; do
-  if ! [[ "${conc}" =~ ^[0-9]+$ ]] || [[ "${conc}" -lt 1 ]]; then
+  if ! [[ "${conc}" =~ ^[0-9]+$ ]] || [[ "${conc}" -lt 0 ]]; then
     echo "skip invalid concurrency value: ${conc}" >&2
     continue
   fi
@@ -106,12 +110,16 @@ for conc in ${CONCURRENCY_LIST}; do
       ENSURE_BUCKET="${ENSURE_BUCKET}" \
       STRESS_MODE="${STRESS_MODE}" \
       INTER_REQUEST_SLEEP_MS="${INTER_REQUEST_SLEEP_MS}" \
+      TARGET_RPS="${TARGET_RPS}" \
+      RUN_DURATION="${RUN_DURATION}" \
       RDMA="${RDMA}" \
       RDMA_DISABLE_FALLBACK="${RDMA_DISABLE_FALLBACK}" \
       RDMA_FRAME_PAYLOAD="${RDMA_FRAME_PAYLOAD}" \
       RDMA_SENDQ="${RDMA_SENDQ}" \
       RDMA_RECVQ="${RDMA_RECVQ}" \
       RDMA_INLINE="${RDMA_INLINE}" \
+      RDMA_LOW_CPU="${RDMA_LOW_CPU}" \
+      RDMA_SEND_SIGNAL_INTERVAL="${RDMA_SEND_SIGNAL_INTERVAL}" \
       RDMA_OPEN_PARALLELISM="${RDMA_OPEN_PARALLELISM}" \
       RDMA_OPEN_INTERVAL="${RDMA_OPEN_INTERVAL}" \
       RESTART_REMOTE_RELAY="${RESTART_REMOTE_RELAY}" \
@@ -129,6 +137,8 @@ for conc in ${CONCURRENCY_LIST}; do
     success_ratio="$(extract_metric "success_ratio" "${run_log}" | sed 's/%$//')"
     duration_s="$(extract_metric "duration" "${run_log}" | sed 's/s$//')"
     success_qps="$(extract_metric "success_qps" "${run_log}")"
+    target_rps="$(extract_metric "target_rps" "${run_log}")"
+    run_duration="$(extract_metric "run_duration" "${run_log}")"
     run_logs="$(extract_metric "logs" "${run_log}")"
 
     cpu_pct="$(extract_metric "request_phase_cpu_pct" "${run_log}")"
@@ -141,6 +151,8 @@ for conc in ${CONCURRENCY_LIST}; do
     success_ratio="${success_ratio:-0}"
     duration_s="${duration_s:-0}"
     success_qps="${success_qps:-0}"
+    target_rps="${target_rps:-${TARGET_RPS}}"
+    run_duration="${run_duration:-${RUN_DURATION}}"
     cpu_pct="${cpu_pct:-0}"
     user_s="${user_s:-0}"
     sys_s="${sys_s:-0}"
@@ -148,10 +160,14 @@ for conc in ${CONCURRENCY_LIST}; do
     run_logs="${run_logs:-${log_dir}}"
 
     if [[ "${rc}" -ne 0 && "${success}" == "0" && "${failed}" == "0" ]]; then
-      failed="${REQUESTS}"
+      if [[ "${REQUESTS}" -gt 0 ]]; then
+        failed="${REQUESTS}"
+      else
+        failed="1"
+      fi
     fi
 
-    echo "${ts},${conc},${round},${rc},${success},${failed},${success_ratio},${duration_s},${success_qps},${cpu_pct},${user_s},${sys_s},${rss_kb},${run_logs}" >>"${OUT_CSV}"
+    echo "${ts},${target_rps},${run_duration},${conc},${round},${rc},${success},${failed},${success_ratio},${duration_s},${success_qps},${cpu_pct},${user_s},${sys_s},${rss_kb},${run_logs}" >>"${OUT_CSV}"
 
     rm -f "${run_log}"
     if [[ "${ROUND_SLEEP_SEC}" != "0" ]]; then
@@ -163,7 +179,7 @@ done
 echo
 echo "benchmark csv: ${OUT_CSV}"
 echo "cpu scope: request phase only"
-echo "summary by concurrency:"
+echo "summary by concurrency+target_rps+run_duration:"
 awk -F',' '
   function sort_numeric(arr, n,    i, j, tmp) {
     for (i = 1; i <= n; i++) {
@@ -178,22 +194,26 @@ awk -F',' '
   }
   NR == 1 { next }
   {
-    c = $2
-    n[c]++
-    succ[c] += $5
-    fail[c] += $6
-    qps[c, n[c]] = $9 + 0
-    cpu[c, n[c]] = $10 + 0
+    key = $4 "|" $2 "|" $3
+    n[key]++
+    succ[key] += $7
+    fail[key] += $8
+    qps[key, n[key]] = $11 + 0
+    cpu[key, n[key]] = $12 + 0
   }
   END {
-    printf "%-12s %-8s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s\n", "concurrency", "runs", "avg_succ", "avg_fail", "avg_qps", "med_qps", "p95_qps", "max_qps", "avg_cpu%", "med_cpu%", "p95_cpu%", "max_cpu%"
-    for (c in n) {
-      m = n[c]
+    printf "%-12s %-12s %-12s %-8s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s\n", "concurrency", "target_rps", "run_dur", "runs", "avg_succ", "avg_fail", "avg_qps", "med_qps", "p95_qps", "max_qps", "avg_cpu%", "med_cpu%", "p95_cpu%", "max_cpu%"
+    for (key in n) {
+      split(key, a, "|")
+      conc = a[1]
+      target = a[2]
+      run_dur = a[3]
+      m = n[key]
       sum_q = 0
       sum_cpu = 0
       for (i = 1; i <= m; i++) {
-        q[i] = qps[c, i]
-        cp[i] = cpu[c, i]
+        q[i] = qps[key, i]
+        cp[i] = cpu[key, i]
         sum_q += q[i]
         sum_cpu += cp[i]
       }
@@ -217,8 +237,8 @@ awk -F',' '
       p95_cpu = cp[p95_idx]
       max_cpu = cp[m]
 
-      printf "%-12s %-8d %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f\n",
-        c, m, succ[c]/m, fail[c]/m, sum_q/m, med_q, p95_q, max_q, sum_cpu/m, med_cpu, p95_cpu, max_cpu
+      printf "%-12s %-12s %-12s %-8d %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f\n",
+        conc, target, run_dur, m, succ[key]/m, fail[key]/m, sum_q/m, med_q, p95_q, max_q, sum_cpu/m, med_cpu, p95_cpu, max_cpu
 
       for (i = 1; i <= m; i++) {
         delete q[i]
@@ -226,4 +246,4 @@ awk -F',' '
       }
     }
   }
-' "${OUT_CSV}" | sort -k1,1n
+' "${OUT_CSV}" | sort -k1,1n -k2,2n -k3,3

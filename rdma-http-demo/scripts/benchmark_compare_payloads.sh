@@ -22,8 +22,8 @@ need_cmd sed
 need_cmd mktemp
 need_cmd truncate
 
-REQUESTS="${REQUESTS:-400}"
-CONCURRENCY_LIST="${CONCURRENCY_LIST:-1 2 4 8 16 32}"
+REQUESTS="${REQUESTS:-0}"
+CONCURRENCY_LIST="${CONCURRENCY_LIST:-0}"
 ROUNDS="${ROUNDS:-3}"
 ROUND_SLEEP_SEC="${ROUND_SLEEP_SEC:-0}"
 
@@ -32,12 +32,16 @@ REQUEST_TIMEOUT_HARD="${REQUEST_TIMEOUT_HARD:-120s}"
 ENSURE_BUCKET="${ENSURE_BUCKET:-false}"
 STRESS_MODE="${STRESS_MODE:-single-process}"
 INTER_REQUEST_SLEEP_MS="${INTER_REQUEST_SLEEP_MS:-0}"
+TARGET_RPS="${TARGET_RPS:-0}"
+RUN_DURATION="${RUN_DURATION:-10s}"
 
-RDMA_OPEN_PARALLELISM="${RDMA_OPEN_PARALLELISM:-1}"
-RDMA_OPEN_INTERVAL="${RDMA_OPEN_INTERVAL:-200ms}"
+RDMA_OPEN_PARALLELISM="${RDMA_OPEN_PARALLELISM:-0}"
+RDMA_OPEN_INTERVAL="${RDMA_OPEN_INTERVAL:-0ms}"
+RDMA_LOW_CPU="${RDMA_LOW_CPU:-true}"
+RDMA_SEND_SIGNAL_INTERVAL="${RDMA_SEND_SIGNAL_INTERVAL:-0}"
 
 RELAY_ENDPOINT="${RELAY_ENDPOINT:-http://10.0.1.2:18080}"
-RELAY_RESTART_REMOTE_RELAY="${RELAY_RESTART_REMOTE_RELAY:-false}"
+RELAY_RESTART_REMOTE_RELAY="${RELAY_RESTART_REMOTE_RELAY:-true}"
 REMOTE_HOST="${REMOTE_HOST:-}"
 REMOTE_USER="${REMOTE_USER:-$USER}"
 REMOTE_RELAY_SERVICE="${REMOTE_RELAY_SERVICE:-rdma-http-relay}"
@@ -65,9 +69,17 @@ if [[ -z "${AWS_ACCESS_KEY_ID}" || -z "${AWS_SECRET_ACCESS_KEY}" ]]; then
 fi
 export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 
-echo "payload_bytes,timestamp,concurrency,round,exit_code,success,failed,success_ratio_pct,duration_s,success_qps,cpu_pct,user_s,sys_s,rss_kb,log_dir" >"${RELAY_CSV}"
-echo "payload_bytes,timestamp,concurrency,round,exit_code,success,failed,success_ratio_pct,duration_s,success_qps,cpu_pct,user_s,sys_s,rss_kb,log_dir" >"${DIRECT_CSV}"
-echo "mode,payload_bytes,timestamp,concurrency,round,exit_code,success,failed,success_ratio_pct,duration_s,success_qps,cpu_pct,user_s,sys_s,rss_kb,log_dir" >"${MERGED_CSV}"
+if [[ "${RELAY_RESTART_REMOTE_RELAY}" != "true" && "${RELAY_RESTART_REMOTE_RELAY}" != "false" ]]; then
+  echo "invalid RELAY_RESTART_REMOTE_RELAY=${RELAY_RESTART_REMOTE_RELAY}, expected true|false" >&2
+  exit 1
+fi
+if [[ "${RELAY_RESTART_REMOTE_RELAY}" == "false" ]]; then
+  echo "warning: RELAY_RESTART_REMOTE_RELAY=false can cause stale RDMA sessions between rounds; hangs/failures may occur" >&2
+fi
+
+echo "payload_bytes,timestamp,target_rps,run_duration,concurrency,round,exit_code,success,failed,success_ratio_pct,duration_s,success_qps,cpu_pct,user_s,sys_s,rss_kb,log_dir" >"${RELAY_CSV}"
+echo "payload_bytes,timestamp,target_rps,run_duration,concurrency,round,exit_code,success,failed,success_ratio_pct,duration_s,success_qps,cpu_pct,user_s,sys_s,rss_kb,log_dir" >"${DIRECT_CSV}"
+echo "mode,payload_bytes,timestamp,target_rps,run_duration,concurrency,round,exit_code,success,failed,success_ratio_pct,duration_s,success_qps,cpu_pct,user_s,sys_s,rss_kb,log_dir" >"${MERGED_CSV}"
 
 run_matrix_once() {
   local mode="$1"
@@ -95,8 +107,12 @@ run_matrix_once() {
     ENSURE_BUCKET="${ENSURE_BUCKET}" \
     STRESS_MODE="${STRESS_MODE}" \
     INTER_REQUEST_SLEEP_MS="${INTER_REQUEST_SLEEP_MS}" \
+    TARGET_RPS="${TARGET_RPS}" \
+    RUN_DURATION="${RUN_DURATION}" \
     RDMA="${rdma}" \
     RDMA_DISABLE_FALLBACK="${rdma_disable_fallback}" \
+    RDMA_LOW_CPU="${RDMA_LOW_CPU}" \
+    RDMA_SEND_SIGNAL_INTERVAL="${RDMA_SEND_SIGNAL_INTERVAL}" \
     RDMA_OPEN_PARALLELISM="${RDMA_OPEN_PARALLELISM}" \
     RDMA_OPEN_INTERVAL="${RDMA_OPEN_INTERVAL}" \
     RESTART_REMOTE_RELAY="${restart_remote_relay}" \
@@ -141,7 +157,7 @@ echo "relay csv:  ${RELAY_CSV}"
 echo "direct csv: ${DIRECT_CSV}"
 echo "cpu scope: request phase only"
 echo
-echo "summary by mode+payload+concurrency:"
+echo "summary by mode+payload+concurrency+target_rps+run_duration:"
 awk -F',' '
   function sort_numeric(arr, n,    i, j, tmp) {
     for (i = 1; i <= n; i++) {
@@ -156,17 +172,22 @@ awk -F',' '
   }
   NR == 1 { next }
   {
-    key = $1 "|" $2 "|" $4
+    key = $1 "|" $2 "|" $6 "|" $4 "|" $5
     n[key]++
-    succ[key] += $7
-    fail[key] += $8
-    qps[key, n[key]] = $11 + 0
-    cpu[key, n[key]] = $12 + 0
+    succ[key] += $9
+    fail[key] += $10
+    qps[key, n[key]] = $13 + 0
+    cpu[key, n[key]] = $14 + 0
   }
   END {
-    printf "%-18s %-14s %-12s %-8s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s\n", "mode", "payload_bytes", "concurrency", "runs", "avg_succ", "avg_fail", "avg_qps", "med_qps", "p95_qps", "max_qps", "avg_cpu%", "med_cpu%", "p95_cpu%", "max_cpu%"
+    printf "%-18s %-14s %-12s %-12s %-12s %-8s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s\n", "mode", "payload_bytes", "concurrency", "target_rps", "run_dur", "runs", "avg_succ", "avg_fail", "avg_qps", "med_qps", "p95_qps", "max_qps", "avg_cpu%", "med_cpu%", "p95_cpu%", "max_cpu%"
     for (key in n) {
       split(key, a, "|")
+      mode = a[1]
+      payload = a[2]
+      conc = a[3]
+      target = a[4]
+      run_dur = a[5]
       m = n[key]
       sum_q = 0
       sum_cpu = 0
@@ -196,8 +217,8 @@ awk -F',' '
       p95_cpu = cp[p95_idx]
       max_cpu = cp[m]
 
-      printf "%-18s %-14s %-12s %-8d %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f\n",
-        a[1], a[2], a[3], m, succ[key]/m, fail[key]/m, sum_q/m, med_q, p95_q, max_q, sum_cpu/m, med_cpu, p95_cpu, max_cpu
+      printf "%-18s %-14s %-12s %-12s %-12s %-8d %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f\n",
+        mode, payload, conc, target, run_dur, m, succ[key]/m, fail[key]/m, sum_q/m, med_q, p95_q, max_q, sum_cpu/m, med_cpu, p95_cpu, max_cpu
 
       for (i = 1; i <= m; i++) {
         delete q[i]
@@ -205,4 +226,4 @@ awk -F',' '
       }
     }
   }
-' "${MERGED_CSV}" | sort -k2,2n -k3,3n -k1,1
+' "${MERGED_CSV}" | sort -k2,2n -k3,3n -k4,4n -k5,5 -k1,1

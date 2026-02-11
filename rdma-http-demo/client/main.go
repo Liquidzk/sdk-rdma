@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +37,8 @@ func main() {
 		requestTimeout      time.Duration
 		count               int
 		concurrency         int
+		targetRPS           float64
+		runDuration         time.Duration
 		autoMkBucket        bool
 		enableRDMA          bool
 		disableRDMAFallback bool
@@ -43,8 +46,11 @@ func main() {
 		rdmaSendQueueDepth  int
 		rdmaRecvQueueDepth  int
 		rdmaInlineThreshold int
+		rdmaLowCPU          bool
+		rdmaSendSignalIntvl int
 		rdmaOpenParallelism int
 		rdmaOpenInterval    time.Duration
+		clientPoolSize      int
 	)
 
 	flag.StringVar(&endpoint, "endpoint", getenv("S3_PROXY_ENDPOINT", "http://127.0.0.1:18080"), "S3 base endpoint (relay server)")
@@ -56,8 +62,10 @@ func main() {
 	flag.StringVar(&payload, "payload", "hello from rdma-http-demo", "payload when -put-file is empty")
 	flag.StringVar(&getOut, "get-out", "", "write GetObject response to file (default stdout)")
 	flag.DurationVar(&requestTimeout, "request-timeout", 30*time.Second, "timeout for each S3 API call (0 disables timeout)")
-	flag.IntVar(&count, "count", 1, "number of operations to execute in this process")
-	flag.IntVar(&concurrency, "concurrency", 1, "worker concurrency when -count > 1")
+	flag.IntVar(&count, "count", 1, "number of operations to execute in this process (ignored when -run-duration > 0)")
+	flag.IntVar(&concurrency, "concurrency", 1, "worker concurrency limit; 0 means no in-flight cap")
+	flag.Float64Var(&targetRPS, "target-rps", getenvFloat("TARGET_RPS", 0), "target request start rate (requests per second); <=0 disables pacing")
+	flag.DurationVar(&runDuration, "run-duration", getenvDuration("RUN_DURATION", 0), "total batch run duration; >0 drives request count from time")
 	flag.BoolVar(&autoMkBucket, "ensure-bucket", true, "create bucket if not found")
 	flag.BoolVar(&enableRDMA, "rdma", true, "enable SDK RDMA transport dialer")
 	flag.BoolVar(&disableRDMAFallback, "rdma-disable-fallback", false, "disable TCP fallback when RDMA open fails")
@@ -65,21 +73,42 @@ func main() {
 	flag.IntVar(&rdmaSendQueueDepth, "rdma-sendq", 0, "RDMA send queue depth (0 uses SDK defaults)")
 	flag.IntVar(&rdmaRecvQueueDepth, "rdma-recvq", 0, "RDMA recv queue depth (0 uses SDK defaults)")
 	flag.IntVar(&rdmaInlineThreshold, "rdma-inline", 0, "RDMA inline threshold bytes (0 uses SDK defaults)")
+	flag.BoolVar(&rdmaLowCPU, "rdma-low-cpu", getenvBool("RDMA_LOW_CPU", true), "favor lower CPU usage over latency/throughput in RDMA transport")
+	flag.IntVar(&rdmaSendSignalIntvl, "rdma-send-signal-interval", getenvInt("RDMA_SEND_SIGNAL_INTERVAL", 0), "RDMA send completion signal interval (0 uses SDK defaults)")
 	flag.IntVar(&rdmaOpenParallelism, "rdma-open-parallelism", awsrdmahttp.DefaultOpenParallelism, "max concurrent RDMA open attempts (0 disables limit)")
 	flag.DurationVar(&rdmaOpenInterval, "rdma-open-interval", awsrdmahttp.DefaultOpenMinInterval, "minimum interval between RDMA open attempts (0 disables spacing)")
+	flag.IntVar(&clientPoolSize, "client-pool-size", getenvInt("S3_CLIENT_POOL_SIZE", 1), "number of independent s3 clients/transports to spread workload across")
 	flag.Parse()
 
-	if count < 1 {
-		log.Fatalf("invalid -count %d, must be >= 1", count)
+	if count < 0 {
+		log.Fatalf("invalid -count %d, must be >= 0", count)
 	}
-	if concurrency < 1 {
-		log.Fatalf("invalid -concurrency %d, must be >= 1", concurrency)
+	if concurrency < 0 {
+		log.Fatalf("invalid -concurrency %d, must be >= 0", concurrency)
+	}
+	if targetRPS < 0 {
+		log.Fatalf("invalid -target-rps %v, must be >= 0", targetRPS)
+	}
+	if runDuration < 0 {
+		log.Fatalf("invalid -run-duration %s, must be >= 0", runDuration)
+	}
+	if runDuration > 0 && targetRPS <= 0 {
+		log.Fatalf("invalid configuration: -run-duration requires -target-rps > 0")
+	}
+	if runDuration <= 0 && count < 1 {
+		log.Fatalf("invalid configuration: set -count >= 1, or set -run-duration > 0")
 	}
 	if rdmaOpenParallelism < 0 {
 		log.Fatalf("invalid -rdma-open-parallelism %d, must be >= 0", rdmaOpenParallelism)
 	}
+	if rdmaSendSignalIntvl < 0 {
+		log.Fatalf("invalid -rdma-send-signal-interval %d, must be >= 0", rdmaSendSignalIntvl)
+	}
 	if rdmaOpenInterval < 0 {
 		log.Fatalf("invalid -rdma-open-interval %s, must be >= 0", rdmaOpenInterval)
+	}
+	if clientPoolSize < 1 {
+		log.Fatalf("invalid -client-pool-size %d, must be >= 1", clientPoolSize)
 	}
 
 	accessKey, secretKey, sessionToken, err := loadCredentialsFromEnv()
@@ -87,29 +116,10 @@ func main() {
 		log.Fatal(err)
 	}
 
-	httpClient := awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
-		tr.Proxy = http.ProxyFromEnvironment
-		tr.MaxIdleConns = 512
-		tr.MaxIdleConnsPerHost = 256
-		tr.IdleConnTimeout = 90 * time.Second
-		tr.ExpectContinueTimeout = 1 * time.Second
-		tr.ForceAttemptHTTP2 = false
-	})
-	if requestTimeout > 0 {
-		httpClient = httpClient.WithTimeout(requestTimeout)
-	}
-
-	closeHTTPClient := func() {
-		httpClient.CloseIdleConnections()
-	}
-	defer closeHTTPClient()
-
 	fail := func(err error) {
-		closeHTTPClient()
 		log.Fatal(err)
 	}
 	failf := func(format string, args ...interface{}) {
-		closeHTTPClient()
 		log.Fatalf(format, args...)
 	}
 
@@ -118,7 +128,6 @@ func main() {
 		ctx,
 		config.WithRegion(region),
 		config.WithBaseEndpoint(endpoint),
-		config.WithHTTPClient(httpClient),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, sessionToken)),
 	)
 	if err != nil {
@@ -130,40 +139,73 @@ func main() {
 		KeepAlive: 30 * time.Second,
 	}).DialContext
 
-	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.UsePathStyle = true
-		o.RetryMaxAttempts = 3
-		if !enableRDMA {
-			return
-		}
-
-		rdmaDialer := awsrdmahttp.NewVerbsDialer(awsrdmahttp.VerbsOptions{
-			FramePayloadSize: rdmaFramePayload,
-			SendQueueDepth:   rdmaSendQueueDepth,
-			RecvQueueDepth:   rdmaRecvQueueDepth,
-			InlineThreshold:  rdmaInlineThreshold,
+	newHTTPClient := func() *awshttp.BuildableClient {
+		httpClient := awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
+			tr.Proxy = http.ProxyFromEnvironment
+			tr.MaxIdleConns = 512
+			tr.MaxIdleConnsPerHost = 256
+			tr.IdleConnTimeout = 90 * time.Second
+			tr.ExpectContinueTimeout = 1 * time.Second
+			tr.ForceAttemptHTTP2 = false
 		})
-		rdmaDialer.OpenParallelism = rdmaOpenParallelism
-		rdmaDialer.OpenMinInterval = rdmaOpenInterval
-		rdmaDialer.DisableFallback = disableRDMAFallback
-		rdmaDialer.FallbackDialContext = fallbackDial
+		if requestTimeout > 0 {
+			httpClient = httpClient.WithTimeout(requestTimeout)
+		}
+		return httpClient
+	}
 
-		o.EnableRDMATransport = true
-		o.RDMADialer = rdmaDialer
-	})
+	newS3Client := func(httpClient *awshttp.BuildableClient) *s3.Client {
+		return s3.NewFromConfig(cfg, func(o *s3.Options) {
+			o.HTTPClient = httpClient
+			o.UsePathStyle = true
+			o.RetryMaxAttempts = 3
+			if !enableRDMA {
+				return
+			}
+
+			rdmaDialer := awsrdmahttp.NewVerbsDialer(awsrdmahttp.VerbsOptions{
+				FramePayloadSize:   rdmaFramePayload,
+				SendQueueDepth:     rdmaSendQueueDepth,
+				RecvQueueDepth:     rdmaRecvQueueDepth,
+				InlineThreshold:    rdmaInlineThreshold,
+				LowCPU:             rdmaLowCPU,
+				SendSignalInterval: rdmaSendSignalIntvl,
+			})
+			rdmaDialer.OpenParallelism = rdmaOpenParallelism
+			rdmaDialer.OpenMinInterval = rdmaOpenInterval
+			rdmaDialer.DisableFallback = disableRDMAFallback
+			rdmaDialer.FallbackDialContext = fallbackDial
+
+			o.EnableRDMATransport = true
+			o.RDMADialer = rdmaDialer
+		})
+	}
+
+	httpClients := make([]*awshttp.BuildableClient, 0, clientPoolSize)
+	clients := make([]*s3.Client, 0, clientPoolSize)
+	for i := 0; i < clientPoolSize; i++ {
+		httpClient := newHTTPClient()
+		httpClients = append(httpClients, httpClient)
+		clients = append(clients, newS3Client(httpClient))
+	}
+	defer func() {
+		for _, hc := range httpClients {
+			hc.CloseIdleConnections()
+		}
+	}()
 
 	if enableRDMA {
 		log.Printf(
-			"RDMA transport enabled fallback=%t frame_payload=%d sendq=%d recvq=%d inline=%d open_parallelism=%d open_interval=%s request_timeout=%s count=%d concurrency=%d",
-			!disableRDMAFallback, rdmaFramePayload, rdmaSendQueueDepth, rdmaRecvQueueDepth, rdmaInlineThreshold, rdmaOpenParallelism, rdmaOpenInterval, requestTimeout, count, concurrency,
+			"RDMA transport enabled fallback=%t frame_payload=%d sendq=%d recvq=%d inline=%d low_cpu=%t send_signal_interval=%d open_parallelism=%d open_interval=%s request_timeout=%s count=%d concurrency=%d target_rps=%.2f run_duration=%s client_pool=%d",
+			!disableRDMAFallback, rdmaFramePayload, rdmaSendQueueDepth, rdmaRecvQueueDepth, rdmaInlineThreshold, rdmaLowCPU, rdmaSendSignalIntvl, rdmaOpenParallelism, rdmaOpenInterval, requestTimeout, count, concurrency, targetRPS, runDuration, clientPoolSize,
 		)
 	} else {
-		log.Printf("RDMA transport disabled; using plain TCP HTTP transport request_timeout=%s count=%d concurrency=%d", requestTimeout, count, concurrency)
+		log.Printf("RDMA transport disabled; using plain TCP HTTP transport request_timeout=%s count=%d concurrency=%d target_rps=%.2f run_duration=%s client_pool=%d", requestTimeout, count, concurrency, targetRPS, runDuration, clientPoolSize)
 	}
 
 	if autoMkBucket {
 		opCtx, cancel := withOpTimeout(ctx, requestTimeout)
-		err := ensureBucket(opCtx, client, bucket)
+		err := ensureBucket(opCtx, clients[0], bucket)
 		cancel()
 		if err != nil {
 			failf("ensure bucket %q failed: %v", bucket, err)
@@ -172,25 +214,41 @@ func main() {
 
 	switch strings.ToLower(mode) {
 	case "put":
-		err := runBatch(count, concurrency, func(i int) error {
+		err := runBatch(batchOptions{
+			Count:       count,
+			Concurrency: concurrency,
+			TargetRPS:   targetRPS,
+			Duration:    runDuration,
+		}, func(worker, i int) error {
 			opCtx, cancel := withOpTimeout(ctx, requestTimeout)
 			defer cancel()
-			return runPut(opCtx, client, bucket, batchKey(key, i), putFile, payload)
+			return runPut(opCtx, clients[worker%len(clients)], bucket, batchKey(key, i), putFile, payload)
 		})
 		if err != nil {
 			fail(err)
 		}
 	case "get":
-		err := runBatch(count, concurrency, func(i int) error {
+		err := runBatch(batchOptions{
+			Count:       count,
+			Concurrency: concurrency,
+			TargetRPS:   targetRPS,
+			Duration:    runDuration,
+		}, func(worker, i int) error {
 			opCtx, cancel := withOpTimeout(ctx, requestTimeout)
 			defer cancel()
-			return runGet(opCtx, client, bucket, batchKey(key, i), getOut)
+			return runGet(opCtx, clients[worker%len(clients)], bucket, batchKey(key, i), getOut)
 		})
 		if err != nil {
 			fail(err)
 		}
 	case "both":
-		err := runBatch(count, concurrency, func(i int) error {
+		err := runBatch(batchOptions{
+			Count:       count,
+			Concurrency: concurrency,
+			TargetRPS:   targetRPS,
+			Duration:    runDuration,
+		}, func(worker, i int) error {
+			client := clients[worker%len(clients)]
 			k := batchKey(key, i)
 
 			opCtxPut, cancelPut := withOpTimeout(ctx, requestTimeout)
@@ -349,6 +407,58 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
+func getenvInt(key string, fallback int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Fatalf("invalid %s=%q: %v", key, v, err)
+	}
+	return n
+}
+
+func getenvBool(key string, fallback bool) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if v == "" {
+		return fallback
+	}
+	switch v {
+	case "1", "true", "t", "yes", "y", "on":
+		return true
+	case "0", "false", "f", "no", "n", "off":
+		return false
+	default:
+		log.Fatalf("invalid %s=%q: expected boolean", key, os.Getenv(key))
+		return fallback
+	}
+}
+
+func getenvFloat(key string, fallback float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		log.Fatalf("invalid %s=%q: %v", key, v, err)
+	}
+	return n
+}
+
+func getenvDuration(key string, fallback time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		log.Fatalf("invalid %s=%q: %v", key, v, err)
+	}
+	return d
+}
+
 func withOpTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if timeout <= 0 {
 		return parent, func() {}
@@ -356,48 +466,134 @@ func withOpTimeout(parent context.Context, timeout time.Duration) (context.Conte
 	return context.WithTimeout(parent, timeout)
 }
 
-func runBatch(count, concurrency int, fn func(index int) error) error {
-	if count == 1 {
-		return fn(1)
+type batchOptions struct {
+	Count       int
+	Concurrency int
+	TargetRPS   float64
+	Duration    time.Duration
+}
+
+func runBatch(opts batchOptions, fn func(worker, index int) error) error {
+	count := opts.Count
+	concurrency := opts.Concurrency
+	targetRPS := opts.TargetRPS
+	runDuration := opts.Duration
+
+	if runDuration <= 0 && count < 1 {
+		return fmt.Errorf("invalid batch options: count=%d run_duration=%s", count, runDuration)
+	}
+	if runDuration > 0 && targetRPS <= 0 {
+		return fmt.Errorf("invalid batch options: run_duration requires target_rps > 0")
 	}
 
-	jobs := make(chan int)
-	errs := make(chan error, count)
+	var (
+		mu       sync.Mutex
+		firstErr error
+		failCnt  int
+	)
+	recordErr := func(idx int, err error) {
+		if err == nil {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		failCnt++
+		if firstErr == nil {
+			firstErr = fmt.Errorf("op %d failed: %w", idx, err)
+		}
+	}
+
+	dispatchCount := 0
+	dispatch := func(submit func(idx int)) {
+		if runDuration > 0 {
+			interval := time.Duration(float64(time.Second) / targetRPS)
+			if interval < time.Nanosecond {
+				interval = time.Nanosecond
+			}
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+
+			deadline := time.Now().Add(runDuration)
+			for idx := 1; ; idx++ {
+				now := time.Now()
+				if now.After(deadline) {
+					break
+				}
+				submit(idx)
+				dispatchCount++
+				<-ticker.C
+			}
+			return
+		}
+
+		if targetRPS > 0 {
+			interval := time.Duration(float64(time.Second) / targetRPS)
+			if interval < time.Nanosecond {
+				interval = time.Nanosecond
+			}
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+
+			for idx := 1; idx <= count; idx++ {
+				if idx > 1 {
+					<-ticker.C
+				}
+				submit(idx)
+				dispatchCount++
+			}
+			return
+		}
+
+		for idx := 1; idx <= count; idx++ {
+			submit(idx)
+			dispatchCount++
+		}
+	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for idx := range jobs {
-				if err := fn(idx); err != nil {
-					errs <- fmt.Errorf("op %d failed: %w", idx, err)
+	if concurrency > 0 {
+		jobs := make(chan int, maxInt(2, concurrency*2))
+		for i := 0; i < concurrency; i++ {
+			workerID := i
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for idx := range jobs {
+					if err := fn(workerID, idx); err != nil {
+						recordErr(idx, err)
+					}
 				}
-			}
-		}()
-	}
-
-	for i := 1; i <= count; i++ {
-		jobs <- i
-	}
-	close(jobs)
-	wg.Wait()
-	close(errs)
-
-	var firstErr error
-	failCount := 0
-	for err := range errs {
-		if firstErr == nil {
-			firstErr = err
+			}()
 		}
-		failCount++
+
+		dispatch(func(idx int) {
+			jobs <- idx
+		})
+		close(jobs)
+		wg.Wait()
+	} else {
+		dispatch(func(idx int) {
+			workerID := idx - 1
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := fn(workerID, idx); err != nil {
+					recordErr(idx, err)
+				}
+			}()
+		})
+		wg.Wait()
 	}
 
-	if failCount > 0 {
-		return fmt.Errorf("batch finished with %d/%d failures: %w", failCount, count, firstErr)
-	}
+	successCnt := dispatchCount - failCnt
+	log.Printf(
+		"batch summary total=%d success=%d failed=%d concurrency_limit=%d target_rps=%.2f run_duration=%s",
+		dispatchCount, successCnt, failCnt, concurrency, targetRPS, runDuration,
+	)
 
-	log.Printf("batch finished successfully count=%d concurrency=%d", count, concurrency)
+	if failCnt > 0 {
+		return fmt.Errorf("batch finished with %d/%d failures: %w", failCnt, dispatchCount, firstErr)
+	}
 	return nil
 }
 
@@ -412,4 +608,11 @@ func batchKey(base string, index int) string {
 		return fmt.Sprintf("%s-%d%s", base[:dot], index, base[dot:])
 	}
 	return fmt.Sprintf("%s-%d", base, index)
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

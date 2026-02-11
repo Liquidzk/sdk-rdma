@@ -31,8 +31,10 @@ KEY_PREFIX="${KEY_PREFIX:-stress}"
 PAYLOAD_PREFIX="${PAYLOAD_PREFIX:-stress-payload}"
 PUT_FILE="${PUT_FILE:-}"
 
-REQUESTS="${REQUESTS:-200}"
-CONCURRENCY="${CONCURRENCY:-16}"
+REQUESTS="${REQUESTS:-0}"
+CONCURRENCY="${CONCURRENCY:-0}"
+TARGET_RPS="${TARGET_RPS:-0}"
+RUN_DURATION="${RUN_DURATION:-10s}"
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-20s}"
 REQUEST_TIMEOUT_HARD="${REQUEST_TIMEOUT_HARD:-45s}"
 ENSURE_BUCKET="${ENSURE_BUCKET:-false}"
@@ -49,8 +51,10 @@ RDMA_FRAME_PAYLOAD="${RDMA_FRAME_PAYLOAD:-0}"
 RDMA_SENDQ="${RDMA_SENDQ:-0}"
 RDMA_RECVQ="${RDMA_RECVQ:-0}"
 RDMA_INLINE="${RDMA_INLINE:-0}"
-RDMA_OPEN_PARALLELISM="${RDMA_OPEN_PARALLELISM:-1}"
-RDMA_OPEN_INTERVAL="${RDMA_OPEN_INTERVAL:-200ms}"
+RDMA_LOW_CPU="${RDMA_LOW_CPU:-true}"
+RDMA_SEND_SIGNAL_INTERVAL="${RDMA_SEND_SIGNAL_INTERVAL:-0}"
+RDMA_OPEN_PARALLELISM="${RDMA_OPEN_PARALLELISM:-0}"
+RDMA_OPEN_INTERVAL="${RDMA_OPEN_INTERVAL:-0ms}"
 
 LOG_DIR="${LOG_DIR:-/tmp/rdma-stress-logs-$(date +%s)}"
 mkdir -p "${LOG_DIR}"
@@ -65,6 +69,18 @@ if [[ -z "${AWS_ACCESS_KEY_ID}" || -z "${AWS_SECRET_ACCESS_KEY}" ]]; then
 fi
 if [[ "${STRESS_MODE}" != "single-process" && "${STRESS_MODE}" != "multi-process" ]]; then
   echo "invalid STRESS_MODE=${STRESS_MODE}, expected single-process|multi-process" >&2
+  exit 1
+fi
+if ! [[ "${REQUESTS}" =~ ^[0-9]+$ ]]; then
+  echo "invalid REQUESTS=${REQUESTS}, expected non-negative integer" >&2
+  exit 1
+fi
+if ! [[ "${CONCURRENCY}" =~ ^[0-9]+$ ]]; then
+  echo "invalid CONCURRENCY=${CONCURRENCY}, expected non-negative integer" >&2
+  exit 1
+fi
+if [[ "${STRESS_MODE}" == "multi-process" && "${REQUESTS}" -lt 1 ]]; then
+  echo "invalid REQUESTS=${REQUESTS}, multi-process mode requires REQUESTS>=1" >&2
   exit 1
 fi
 if [[ "${RESTART_REMOTE_RELAY}" != "true" && "${RESTART_REMOTE_RELAY}" != "false" ]]; then
@@ -107,6 +123,21 @@ parse_endpoint_host() {
   fi
 
   echo "${host}"
+}
+
+extract_batch_metric() {
+  local key="$1"
+  local file="$2"
+  awk -v k="${key}" '
+    /batch summary/ {
+      for (i = 1; i <= NF; i++) {
+        split($i, a, "=")
+        if (a[1] == k) {
+          print a[2]
+        }
+      }
+    }
+  ' "${file}" | tail -n1
 }
 
 restart_remote_relay() {
@@ -152,12 +183,16 @@ if [[ "${STRESS_MODE}" == "multi-process" ]]; then
       -ensure-bucket=true \
       -count=1 \
       -concurrency=1 \
+      -target-rps="${TARGET_RPS}" \
+      -run-duration=0s \
       -rdma="${RDMA}" \
       -rdma-disable-fallback="${RDMA_DISABLE_FALLBACK}" \
       -rdma-frame-payload="${RDMA_FRAME_PAYLOAD}" \
       -rdma-sendq="${RDMA_SENDQ}" \
       -rdma-recvq="${RDMA_RECVQ}" \
       -rdma-inline="${RDMA_INLINE}" \
+      -rdma-low-cpu="${RDMA_LOW_CPU}" \
+      -rdma-send-signal-interval="${RDMA_SEND_SIGNAL_INTERVAL}" \
       -rdma-open-parallelism="${RDMA_OPEN_PARALLELISM}" \
       -rdma-open-interval="${RDMA_OPEN_INTERVAL}" \
       -request-timeout="${REQUEST_TIMEOUT}" \
@@ -173,12 +208,16 @@ if [[ "${STRESS_MODE}" == "multi-process" ]]; then
       -ensure-bucket=false \
       -count=1 \
       -concurrency=1 \
+      -target-rps="${TARGET_RPS}" \
+      -run-duration=0s \
       -rdma="${RDMA}" \
       -rdma-disable-fallback="${RDMA_DISABLE_FALLBACK}" \
       -rdma-frame-payload="${RDMA_FRAME_PAYLOAD}" \
       -rdma-sendq="${RDMA_SENDQ}" \
       -rdma-recvq="${RDMA_RECVQ}" \
       -rdma-inline="${RDMA_INLINE}" \
+      -rdma-low-cpu="${RDMA_LOW_CPU}" \
+      -rdma-send-signal-interval="${RDMA_SEND_SIGNAL_INTERVAL}" \
       -rdma-open-parallelism="${RDMA_OPEN_PARALLELISM}" \
       -rdma-open-interval="${RDMA_OPEN_INTERVAL}" \
       -request-timeout="${REQUEST_TIMEOUT}" \
@@ -192,8 +231,8 @@ ok_file="$(mktemp)"
 fail_file="$(mktemp)"
 trap 'rm -f "${ok_file}" "${fail_file}"' EXIT
 
-export BIN_PATH ENDPOINT BUCKET KEY_PREFIX PAYLOAD_PREFIX REQUESTS CONCURRENCY REQUEST_TIMEOUT REQUEST_TIMEOUT_HARD
-export RDMA RDMA_DISABLE_FALLBACK RDMA_FRAME_PAYLOAD RDMA_SENDQ RDMA_RECVQ RDMA_INLINE
+export BIN_PATH ENDPOINT BUCKET KEY_PREFIX PAYLOAD_PREFIX REQUESTS CONCURRENCY TARGET_RPS RUN_DURATION REQUEST_TIMEOUT REQUEST_TIMEOUT_HARD
+export RDMA RDMA_DISABLE_FALLBACK RDMA_FRAME_PAYLOAD RDMA_SENDQ RDMA_RECVQ RDMA_INLINE RDMA_LOW_CPU RDMA_SEND_SIGNAL_INTERVAL
 export RDMA_OPEN_PARALLELISM RDMA_OPEN_INTERVAL
 export LOG_DIR ok_file fail_file INTER_REQUEST_SLEEP_MS PUT_FILE
 
@@ -203,7 +242,7 @@ rm -f "${request_time_log}"
 start_ns="$(date +%s%N)"
 if [[ "${STRESS_MODE}" == "single-process" ]]; then
   batch_log="${LOG_DIR}/batch.log"
-  echo "[3/4] running stress requests=${REQUESTS} concurrency=${CONCURRENCY} (single-process)"
+  echo "[3/4] running stress duration=${RUN_DURATION} target_rps=${TARGET_RPS} concurrency_limit=${CONCURRENCY} (single-process)"
   set +e
   if [[ -x "${TIME_BIN}" ]]; then
     "${TIME_BIN}" -f "elapsed=%e user=%U sys=%S cpu_pct=%P rss_kb=%M" -o "${request_time_log}" \
@@ -216,12 +255,16 @@ if [[ "${STRESS_MODE}" == "single-process" ]]; then
       -ensure-bucket=false \
       -count="${REQUESTS}" \
       -concurrency="${CONCURRENCY}" \
+      -target-rps="${TARGET_RPS}" \
+      -run-duration="${RUN_DURATION}" \
       -rdma="${RDMA}" \
       -rdma-disable-fallback="${RDMA_DISABLE_FALLBACK}" \
       -rdma-frame-payload="${RDMA_FRAME_PAYLOAD}" \
       -rdma-sendq="${RDMA_SENDQ}" \
       -rdma-recvq="${RDMA_RECVQ}" \
       -rdma-inline="${RDMA_INLINE}" \
+      -rdma-low-cpu="${RDMA_LOW_CPU}" \
+      -rdma-send-signal-interval="${RDMA_SEND_SIGNAL_INTERVAL}" \
       -rdma-open-parallelism="${RDMA_OPEN_PARALLELISM}" \
       -rdma-open-interval="${RDMA_OPEN_INTERVAL}" \
       -request-timeout="${REQUEST_TIMEOUT}" \
@@ -236,12 +279,16 @@ if [[ "${STRESS_MODE}" == "single-process" ]]; then
       -ensure-bucket=false \
       -count="${REQUESTS}" \
       -concurrency="${CONCURRENCY}" \
+      -target-rps="${TARGET_RPS}" \
+      -run-duration="${RUN_DURATION}" \
       -rdma="${RDMA}" \
       -rdma-disable-fallback="${RDMA_DISABLE_FALLBACK}" \
       -rdma-frame-payload="${RDMA_FRAME_PAYLOAD}" \
       -rdma-sendq="${RDMA_SENDQ}" \
       -rdma-recvq="${RDMA_RECVQ}" \
       -rdma-inline="${RDMA_INLINE}" \
+      -rdma-low-cpu="${RDMA_LOW_CPU}" \
+      -rdma-send-signal-interval="${RDMA_SEND_SIGNAL_INTERVAL}" \
       -rdma-open-parallelism="${RDMA_OPEN_PARALLELISM}" \
       -rdma-open-interval="${RDMA_OPEN_INTERVAL}" \
       -request-timeout="${REQUEST_TIMEOUT}" \
@@ -250,15 +297,28 @@ if [[ "${STRESS_MODE}" == "single-process" ]]; then
   batch_rc=$?
   set -e
 
-  ok_count="$(grep -c "PutObject ok" "${batch_log}" || true)"
-  if [[ "${ok_count}" -gt "${REQUESTS}" ]]; then
-    ok_count="${REQUESTS}"
+  total_count="$(extract_batch_metric "total" "${batch_log}")"
+  ok_count="$(extract_batch_metric "success" "${batch_log}")"
+  fail_count="$(extract_batch_metric "failed" "${batch_log}")"
+
+  if [[ -z "${ok_count}" ]]; then
+    ok_count="$(grep -c "PutObject ok" "${batch_log}" || true)"
   fi
-  fail_count="$((REQUESTS - ok_count))"
-  if [[ "${batch_rc}" -eq 0 && "${fail_count}" -eq 0 ]]; then
-    :
-  elif [[ "${fail_count}" -eq 0 ]]; then
+  if [[ -z "${fail_count}" ]]; then
+    if [[ -n "${total_count}" && "${total_count}" =~ ^[0-9]+$ ]]; then
+      fail_count="$((total_count - ok_count))"
+    elif [[ "${REQUESTS}" -gt 0 ]]; then
+      fail_count="$((REQUESTS - ok_count))"
+    else
+      fail_count=0
+    fi
+  fi
+  if [[ -z "${total_count}" || ! "${total_count}" =~ ^[0-9]+$ ]]; then
+    total_count="$((ok_count + fail_count))"
+  fi
+  if [[ "${batch_rc}" -ne 0 && "${fail_count}" -eq 0 ]]; then
     fail_count=1
+    total_count="$((ok_count + fail_count))"
   fi
 else
   echo "[3/4] running stress requests=${REQUESTS} concurrency=${CONCURRENCY} (multi-process)"
@@ -290,12 +350,16 @@ else
         -ensure-bucket=false \
         -count=1 \
         -concurrency=1 \
+        -target-rps="${TARGET_RPS}" \
+        -run-duration=0s \
         -rdma="${RDMA}" \
         -rdma-disable-fallback="${RDMA_DISABLE_FALLBACK}" \
         -rdma-frame-payload="${RDMA_FRAME_PAYLOAD}" \
         -rdma-sendq="${RDMA_SENDQ}" \
         -rdma-recvq="${RDMA_RECVQ}" \
         -rdma-inline="${RDMA_INLINE}" \
+        -rdma-low-cpu="${RDMA_LOW_CPU}" \
+        -rdma-send-signal-interval="${RDMA_SEND_SIGNAL_INTERVAL}" \
         -rdma-open-parallelism="${RDMA_OPEN_PARALLELISM}" \
         -rdma-open-interval="${RDMA_OPEN_INTERVAL}" \
         -request-timeout="${REQUEST_TIMEOUT}" \
@@ -331,12 +395,16 @@ else
       -ensure-bucket=false \
       -count=1 \
       -concurrency=1 \
+      -target-rps="${TARGET_RPS}" \
+      -run-duration=0s \
       -rdma="${RDMA}" \
       -rdma-disable-fallback="${RDMA_DISABLE_FALLBACK}" \
       -rdma-frame-payload="${RDMA_FRAME_PAYLOAD}" \
       -rdma-sendq="${RDMA_SENDQ}" \
       -rdma-recvq="${RDMA_RECVQ}" \
       -rdma-inline="${RDMA_INLINE}" \
+      -rdma-low-cpu="${RDMA_LOW_CPU}" \
+      -rdma-send-signal-interval="${RDMA_SEND_SIGNAL_INTERVAL}" \
       -rdma-open-parallelism="${RDMA_OPEN_PARALLELISM}" \
       -rdma-open-interval="${RDMA_OPEN_INTERVAL}" \
       -request-timeout="${REQUEST_TIMEOUT}" \
@@ -355,12 +423,11 @@ else
   if [[ "${batch_rc}" -ne 0 && "${fail_count}" -eq 0 ]]; then
     fail_count=1
   fi
+  total_count="$((ok_count + fail_count))"
 fi
 
 end_ns="$(date +%s%N)"
 duration_ns="$((end_ns - start_ns))"
-
-total_count="$((ok_count + fail_count))"
 
 duration_sec="$(awk "BEGIN{printf \"%.3f\", ${duration_ns}/1000000000}")"
 success_qps="$(awk "BEGIN{if (${duration_ns} > 0) printf \"%.2f\", ${ok_count}*1000000000/${duration_ns}; else print \"0.00\"}")"
@@ -382,8 +449,11 @@ fi
 echo "[4/4] done"
 echo "endpoint:      ${ENDPOINT}"
 echo "payload:       ${payload_desc}"
-echo "requests:      ${REQUESTS}"
-echo "concurrency:   ${CONCURRENCY}"
+echo "run_duration:  ${RUN_DURATION}"
+echo "requests_cfg:  ${REQUESTS}"
+echo "requests:      ${total_count}"
+echo "concurrency:   ${CONCURRENCY} (0=unlimited)"
+echo "target_rps:    ${TARGET_RPS}"
 echo "success:       ${ok_count}"
 echo "failed:        ${fail_count}"
 echo "success_ratio: ${success_ratio}%"

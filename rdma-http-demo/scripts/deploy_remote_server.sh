@@ -15,6 +15,16 @@ MINIO_CONSOLE_ADDRESS="${MINIO_CONSOLE_ADDRESS:-:9001}"
 
 RELAY_LISTEN_ADDR="${RELAY_LISTEN_ADDR:-:18080}"
 RELAY_MINIO_ENDPOINT="${RELAY_MINIO_ENDPOINT:-http://127.0.0.1:9000}"
+RELAY_RDMA_ENABLED="${RELAY_RDMA_ENABLED:-true}"
+RELAY_RDMA_NETWORK="${RELAY_RDMA_NETWORK:-rdma}"
+RELAY_RDMA_BACKLOG="${RELAY_RDMA_BACKLOG:-0}"
+RELAY_RDMA_FRAME_PAYLOAD="${RELAY_RDMA_FRAME_PAYLOAD:-0}"
+RELAY_RDMA_SENDQ="${RELAY_RDMA_SENDQ:-0}"
+RELAY_RDMA_RECVQ="${RELAY_RDMA_RECVQ:-0}"
+RELAY_RDMA_INLINE="${RELAY_RDMA_INLINE:-0}"
+RELAY_RDMA_LOW_CPU="${RELAY_RDMA_LOW_CPU:-true}"
+RELAY_RDMA_SEND_SIGNAL_INTERVAL="${RELAY_RDMA_SEND_SIGNAL_INTERVAL:-0}"
+RELAY_RDMA_ACCEPT_WORKERS="${RELAY_RDMA_ACCEPT_WORKERS:-0}"
 RELAY_DISABLE_CLIENT_KEEPALIVE="${RELAY_DISABLE_CLIENT_KEEPALIVE:-false}"
 RELAY_ACCESS_LOG="${RELAY_ACCESS_LOG:-false}"
 RELAY_STATS_INTERVAL="${RELAY_STATS_INTERVAL:-30s}"
@@ -73,6 +83,16 @@ ssh "${REMOTE}" "sudo bash -s -- \
   $(printf '%q' "${MINIO_CONSOLE_ADDRESS}") \
   $(printf '%q' "${RELAY_LISTEN_ADDR}") \
   $(printf '%q' "${RELAY_MINIO_ENDPOINT}") \
+  $(printf '%q' "${RELAY_RDMA_ENABLED}") \
+  $(printf '%q' "${RELAY_RDMA_NETWORK}") \
+  $(printf '%q' "${RELAY_RDMA_BACKLOG}") \
+  $(printf '%q' "${RELAY_RDMA_FRAME_PAYLOAD}") \
+  $(printf '%q' "${RELAY_RDMA_SENDQ}") \
+  $(printf '%q' "${RELAY_RDMA_RECVQ}") \
+  $(printf '%q' "${RELAY_RDMA_INLINE}") \
+  $(printf '%q' "${RELAY_RDMA_LOW_CPU}") \
+  $(printf '%q' "${RELAY_RDMA_SEND_SIGNAL_INTERVAL}") \
+  $(printf '%q' "${RELAY_RDMA_ACCEPT_WORKERS}") \
   $(printf '%q' "${RELAY_DISABLE_CLIENT_KEEPALIVE}") \
   $(printf '%q' "${RELAY_ACCESS_LOG}") \
   $(printf '%q' "${RELAY_STATS_INTERVAL}") \
@@ -97,21 +117,31 @@ MINIO_ADDRESS="$4"
 MINIO_CONSOLE_ADDRESS="$5"
 RELAY_LISTEN_ADDR="$6"
 RELAY_MINIO_ENDPOINT="$7"
-RELAY_DISABLE_CLIENT_KEEPALIVE="$8"
-RELAY_ACCESS_LOG="$9"
-RELAY_STATS_INTERVAL="${10}"
-RELAY_MAX_INFLIGHT="${11}"
-RELAY_UPSTREAM_MAX_IDLE_CONNS="${12}"
-RELAY_UPSTREAM_MAX_IDLE_CONNS_PER_HOST="${13}"
-RELAY_UPSTREAM_MAX_CONNS_PER_HOST="${14}"
-RELAY_UPSTREAM_IDLE_CONN_TIMEOUT="${15}"
-RELAY_UPSTREAM_RESPONSE_HEADER_TIMEOUT="${16}"
-RELAY_UPSTREAM_DISABLE_COMPRESSION="${17}"
-RELAY_SERVER_READ_HEADER_TIMEOUT="${18}"
-RELAY_SERVER_READ_TIMEOUT="${19}"
-RELAY_SERVER_WRITE_TIMEOUT="${20}"
-RELAY_SERVER_IDLE_TIMEOUT="${21}"
-RELAY_SERVER_MAX_HEADER_BYTES="${22}"
+RELAY_RDMA_ENABLED="$8"
+RELAY_RDMA_NETWORK="$9"
+RELAY_RDMA_BACKLOG="${10}"
+RELAY_RDMA_FRAME_PAYLOAD="${11}"
+RELAY_RDMA_SENDQ="${12}"
+RELAY_RDMA_RECVQ="${13}"
+RELAY_RDMA_INLINE="${14}"
+RELAY_RDMA_LOW_CPU="${15}"
+RELAY_RDMA_SEND_SIGNAL_INTERVAL="${16}"
+RELAY_RDMA_ACCEPT_WORKERS="${17}"
+RELAY_DISABLE_CLIENT_KEEPALIVE="${18}"
+RELAY_ACCESS_LOG="${19}"
+RELAY_STATS_INTERVAL="${20}"
+RELAY_MAX_INFLIGHT="${21}"
+RELAY_UPSTREAM_MAX_IDLE_CONNS="${22}"
+RELAY_UPSTREAM_MAX_IDLE_CONNS_PER_HOST="${23}"
+RELAY_UPSTREAM_MAX_CONNS_PER_HOST="${24}"
+RELAY_UPSTREAM_IDLE_CONN_TIMEOUT="${25}"
+RELAY_UPSTREAM_RESPONSE_HEADER_TIMEOUT="${26}"
+RELAY_UPSTREAM_DISABLE_COMPRESSION="${27}"
+RELAY_SERVER_READ_HEADER_TIMEOUT="${28}"
+RELAY_SERVER_READ_TIMEOUT="${29}"
+RELAY_SERVER_WRITE_TIMEOUT="${30}"
+RELAY_SERVER_IDLE_TIMEOUT="${31}"
+RELAY_SERVER_MAX_HEADER_BYTES="${32}"
 
 if ! command -v systemctl >/dev/null 2>&1; then
   echo "systemd is required on remote host" >&2
@@ -204,6 +234,16 @@ rm -f /tmp/rdma-http-relay
 cat >/etc/default/rdma-http-relay <<EOF
 LISTEN_ADDR=$(printf '%q' "${RELAY_LISTEN_ADDR}")
 MINIO_ENDPOINT=$(printf '%q' "${RELAY_MINIO_ENDPOINT}")
+RDMA_ENABLED=$(printf '%q' "${RELAY_RDMA_ENABLED}")
+RDMA_NETWORK=$(printf '%q' "${RELAY_RDMA_NETWORK}")
+RDMA_BACKLOG=$(printf '%q' "${RELAY_RDMA_BACKLOG}")
+RDMA_FRAME_PAYLOAD=$(printf '%q' "${RELAY_RDMA_FRAME_PAYLOAD}")
+RDMA_SENDQ=$(printf '%q' "${RELAY_RDMA_SENDQ}")
+RDMA_RECVQ=$(printf '%q' "${RELAY_RDMA_RECVQ}")
+RDMA_INLINE=$(printf '%q' "${RELAY_RDMA_INLINE}")
+RDMA_LOW_CPU=$(printf '%q' "${RELAY_RDMA_LOW_CPU}")
+RDMA_SEND_SIGNAL_INTERVAL=$(printf '%q' "${RELAY_RDMA_SEND_SIGNAL_INTERVAL}")
+RDMA_ACCEPT_WORKERS=$(printf '%q' "${RELAY_RDMA_ACCEPT_WORKERS}")
 DISABLE_CLIENT_KEEPALIVE=$(printf '%q' "${RELAY_DISABLE_CLIENT_KEEPALIVE}")
 ACCESS_LOG=$(printf '%q' "${RELAY_ACCESS_LOG}")
 STATS_INTERVAL=$(printf '%q' "${RELAY_STATS_INTERVAL}")
@@ -233,10 +273,11 @@ Requires=minio.service
 User=rdmarelay
 Group=rdmarelay
 EnvironmentFile=/etc/default/rdma-http-relay
-ExecStart=/usr/local/bin/rdma-http-relay -listen=${LISTEN_ADDR} -minio-endpoint=${MINIO_ENDPOINT} -disable-client-keepalive=${DISABLE_CLIENT_KEEPALIVE} -access-log=${ACCESS_LOG} -stats-interval=${STATS_INTERVAL} -max-inflight=${MAX_INFLIGHT} -upstream-max-idle-conns=${UPSTREAM_MAX_IDLE_CONNS} -upstream-max-idle-conns-per-host=${UPSTREAM_MAX_IDLE_CONNS_PER_HOST} -upstream-max-conns-per-host=${UPSTREAM_MAX_CONNS_PER_HOST} -upstream-idle-conn-timeout=${UPSTREAM_IDLE_CONN_TIMEOUT} -upstream-response-header-timeout=${UPSTREAM_RESPONSE_HEADER_TIMEOUT} -upstream-disable-compression=${UPSTREAM_DISABLE_COMPRESSION} -server-read-header-timeout=${SERVER_READ_HEADER_TIMEOUT} -server-read-timeout=${SERVER_READ_TIMEOUT} -server-write-timeout=${SERVER_WRITE_TIMEOUT} -server-idle-timeout=${SERVER_IDLE_TIMEOUT} -server-max-header-bytes=${SERVER_MAX_HEADER_BYTES}
+ExecStart=/usr/local/bin/rdma-http-relay -listen=${LISTEN_ADDR} -minio-endpoint=${MINIO_ENDPOINT} -rdma=${RDMA_ENABLED} -rdma-network=${RDMA_NETWORK} -rdma-backlog=${RDMA_BACKLOG} -rdma-accept-workers=${RDMA_ACCEPT_WORKERS} -rdma-frame-payload=${RDMA_FRAME_PAYLOAD} -rdma-sendq=${RDMA_SENDQ} -rdma-recvq=${RDMA_RECVQ} -rdma-inline=${RDMA_INLINE} -rdma-low-cpu=${RDMA_LOW_CPU} -rdma-send-signal-interval=${RDMA_SEND_SIGNAL_INTERVAL} -disable-client-keepalive=${DISABLE_CLIENT_KEEPALIVE} -access-log=${ACCESS_LOG} -stats-interval=${STATS_INTERVAL} -max-inflight=${MAX_INFLIGHT} -upstream-max-idle-conns=${UPSTREAM_MAX_IDLE_CONNS} -upstream-max-idle-conns-per-host=${UPSTREAM_MAX_IDLE_CONNS_PER_HOST} -upstream-max-conns-per-host=${UPSTREAM_MAX_CONNS_PER_HOST} -upstream-idle-conn-timeout=${UPSTREAM_IDLE_CONN_TIMEOUT} -upstream-response-header-timeout=${UPSTREAM_RESPONSE_HEADER_TIMEOUT} -upstream-disable-compression=${UPSTREAM_DISABLE_COMPRESSION} -server-read-header-timeout=${SERVER_READ_HEADER_TIMEOUT} -server-read-timeout=${SERVER_READ_TIMEOUT} -server-write-timeout=${SERVER_WRITE_TIMEOUT} -server-idle-timeout=${SERVER_IDLE_TIMEOUT} -server-max-header-bytes=${SERVER_MAX_HEADER_BYTES}
 Restart=always
 RestartSec=2
 LimitNOFILE=65536
+LimitMEMLOCK=infinity
 
 [Install]
 WantedBy=multi-user.target

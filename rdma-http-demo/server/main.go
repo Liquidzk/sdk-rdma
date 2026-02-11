@@ -194,10 +194,13 @@ func main() {
 	var disableClientKeepAlive bool
 	var rdmaNetwork string
 	var rdmaBacklog int
+	var rdmaAcceptWorkers int
 	var rdmaFramePayload int
 	var rdmaSendQueueDepth int
 	var rdmaRecvQueueDepth int
 	var rdmaInlineThreshold int
+	var rdmaLowCPU bool
+	var rdmaSendSignalIntvl int
 	var accessLog bool
 	var statsInterval time.Duration
 	var maxInflight int
@@ -218,10 +221,13 @@ func main() {
 	flag.BoolVar(&disableClientKeepAlive, "disable-client-keepalive", false, "force close relay-side client connections after each response")
 	flag.StringVar(&rdmaNetwork, "rdma-network", getenv("RDMA_NETWORK", "rdma"), "RDMA listener network: rdma|rdma4|rdma6")
 	flag.IntVar(&rdmaBacklog, "rdma-backlog", 0, "RDMA listen backlog (0 uses SDK defaults)")
+	flag.IntVar(&rdmaAcceptWorkers, "rdma-accept-workers", getenvInt("RDMA_ACCEPT_WORKERS", 0), "RDMA accept worker count (0 uses SDK defaults)")
 	flag.IntVar(&rdmaFramePayload, "rdma-frame-payload", 0, "RDMA frame payload bytes (0 uses SDK defaults)")
 	flag.IntVar(&rdmaSendQueueDepth, "rdma-sendq", 0, "RDMA send queue depth (0 uses SDK defaults)")
 	flag.IntVar(&rdmaRecvQueueDepth, "rdma-recvq", 0, "RDMA recv queue depth (0 uses SDK defaults)")
 	flag.IntVar(&rdmaInlineThreshold, "rdma-inline", 0, "RDMA inline threshold bytes (0 uses SDK defaults)")
+	flag.BoolVar(&rdmaLowCPU, "rdma-low-cpu", getenvBool("RDMA_LOW_CPU", true), "favor lower CPU usage over latency/throughput in RDMA transport")
+	flag.IntVar(&rdmaSendSignalIntvl, "rdma-send-signal-interval", getenvInt("RDMA_SEND_SIGNAL_INTERVAL", 0), "RDMA send completion signal interval (0 uses SDK defaults)")
 	flag.BoolVar(&accessLog, "access-log", getenvBool("RELAY_ACCESS_LOG", true), "log one line per proxied request")
 	flag.DurationVar(&statsInterval, "stats-interval", getenvDuration("RELAY_STATS_INTERVAL", 30*time.Second), "periodic relay stats log interval (0 disables)")
 	flag.IntVar(&maxInflight, "max-inflight", getenvInt("RELAY_MAX_INFLIGHT", 0), "max in-flight requests (0 disables overload shedding)")
@@ -247,6 +253,12 @@ func main() {
 	}
 	if maxInflight < 0 {
 		log.Fatalf("invalid -max-inflight %d, must be >= 0", maxInflight)
+	}
+	if rdmaAcceptWorkers < 0 {
+		log.Fatalf("invalid -rdma-accept-workers %d, must be >= 0", rdmaAcceptWorkers)
+	}
+	if rdmaSendSignalIntvl < 0 {
+		log.Fatalf("invalid -rdma-send-signal-interval %d, must be >= 0", rdmaSendSignalIntvl)
 	}
 	if upstreamMaxIdleConns < 0 || upstreamMaxIdleConnsPerHost < 0 || upstreamMaxConnsPerHost < 0 {
 		log.Fatalf("invalid upstream pool config: max-idle=%d max-idle-per-host=%d max-conns-per-host=%d (must be >= 0)",
@@ -298,12 +310,15 @@ func main() {
 
 	ln, err := buildListener(enableRDMA, rdmaNetwork, listenAddr, awsrdmahttp.VerbsListenerOptions{
 		VerbsOptions: awsrdmahttp.VerbsOptions{
-			FramePayloadSize: rdmaFramePayload,
-			SendQueueDepth:   rdmaSendQueueDepth,
-			RecvQueueDepth:   rdmaRecvQueueDepth,
-			InlineThreshold:  rdmaInlineThreshold,
+			FramePayloadSize:   rdmaFramePayload,
+			SendQueueDepth:     rdmaSendQueueDepth,
+			RecvQueueDepth:     rdmaRecvQueueDepth,
+			InlineThreshold:    rdmaInlineThreshold,
+			LowCPU:             rdmaLowCPU,
+			SendSignalInterval: rdmaSendSignalIntvl,
 		},
-		Backlog: rdmaBacklog,
+		Backlog:       rdmaBacklog,
+		AcceptWorkers: rdmaAcceptWorkers,
 	})
 	if err != nil {
 		log.Fatalf("listener init failed: %v", err)
@@ -312,8 +327,8 @@ func main() {
 
 	if enableRDMA {
 		log.Printf(
-			"rdma-http relay listening via RDMA on %s (network=%s backlog=%d frame_payload=%d sendq=%d recvq=%d inline=%d) -> %s; inflight_limit=%d upstream_pool[max_idle=%d max_idle_per_host=%d max_conns_per_host=%d idle_timeout=%s] access_log=%t stats_interval=%s",
-			listenAddr, rdmaNetwork, rdmaBacklog, rdmaFramePayload, rdmaSendQueueDepth, rdmaRecvQueueDepth, rdmaInlineThreshold, upstream.String(),
+			"rdma-http relay listening via RDMA on %s (network=%s backlog=%d accept_workers=%d frame_payload=%d sendq=%d recvq=%d inline=%d low_cpu=%t send_signal_interval=%d) -> %s; inflight_limit=%d upstream_pool[max_idle=%d max_idle_per_host=%d max_conns_per_host=%d idle_timeout=%s] access_log=%t stats_interval=%s",
+			listenAddr, rdmaNetwork, rdmaBacklog, rdmaAcceptWorkers, rdmaFramePayload, rdmaSendQueueDepth, rdmaRecvQueueDepth, rdmaInlineThreshold, rdmaLowCPU, rdmaSendSignalIntvl, upstream.String(),
 			maxInflight, upstreamMaxIdleConns, upstreamMaxIdleConnsPerHost, upstreamMaxConnsPerHost, upstreamIdleConnTimeout, accessLog, statsInterval,
 		)
 	} else {

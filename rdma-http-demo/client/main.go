@@ -10,10 +10,12 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
@@ -23,6 +25,78 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	smithy "github.com/aws/smithy-go"
 )
+
+type connTraceStats struct {
+	gotConnTotal   atomic.Int64
+	gotConnReused  atomic.Int64
+	gotConnNew     atomic.Int64
+	gotConnWasIdle atomic.Int64
+
+	rdmaOpenCalls   atomic.Int64
+	rdmaOpenSuccess atomic.Int64
+	rdmaOpenFailed  atomic.Int64
+}
+
+func withConnTrace(ctx context.Context, stats *connTraceStats) context.Context {
+	if stats == nil {
+		return ctx
+	}
+
+	trace := &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			stats.gotConnTotal.Add(1)
+			if info.Reused {
+				stats.gotConnReused.Add(1)
+			} else {
+				stats.gotConnNew.Add(1)
+			}
+			if info.WasIdle {
+				stats.gotConnWasIdle.Add(1)
+			}
+		},
+	}
+	return httptrace.WithClientTrace(ctx, trace)
+}
+
+func (s *connTraceStats) logSummary(enableRDMA bool) {
+	if s == nil {
+		return
+	}
+
+	gotTotal := s.gotConnTotal.Load()
+	gotReused := s.gotConnReused.Load()
+	gotNew := s.gotConnNew.Load()
+	gotWasIdle := s.gotConnWasIdle.Load()
+
+	reusePct := 0.0
+	if gotTotal > 0 {
+		reusePct = (float64(gotReused) * 100.0) / float64(gotTotal)
+	}
+
+	if enableRDMA {
+		log.Printf(
+			"conn trace got_conn_total=%d got_conn_reused=%d got_conn_new=%d got_conn_was_idle=%d reuse_pct=%.2f rdma_open_calls=%d rdma_open_success=%d rdma_open_failed=%d",
+			gotTotal,
+			gotReused,
+			gotNew,
+			gotWasIdle,
+			reusePct,
+			s.rdmaOpenCalls.Load(),
+			s.rdmaOpenSuccess.Load(),
+			s.rdmaOpenFailed.Load(),
+		)
+		return
+	}
+
+	log.Printf(
+		"conn trace got_conn_total=%d got_conn_reused=%d got_conn_new=%d got_conn_was_idle=%d reuse_pct=%.2f",
+		gotTotal,
+		gotReused,
+		gotNew,
+		gotWasIdle,
+		reusePct,
+	)
+}
 
 func main() {
 	var (
@@ -51,6 +125,9 @@ func main() {
 		rdmaOpenParallelism int
 		rdmaOpenInterval    time.Duration
 		clientPoolSize      int
+		retryMaxAttempts    int
+		enableConnTrace     bool
+		logEachRequest      bool
 	)
 
 	flag.StringVar(&endpoint, "endpoint", getenv("S3_PROXY_ENDPOINT", "http://127.0.0.1:18080"), "S3 base endpoint (relay server)")
@@ -75,9 +152,12 @@ func main() {
 	flag.IntVar(&rdmaInlineThreshold, "rdma-inline", 0, "RDMA inline threshold bytes (0 uses SDK defaults)")
 	flag.BoolVar(&rdmaLowCPU, "rdma-low-cpu", getenvBool("RDMA_LOW_CPU", true), "favor lower CPU usage over latency/throughput in RDMA transport")
 	flag.IntVar(&rdmaSendSignalIntvl, "rdma-send-signal-interval", getenvInt("RDMA_SEND_SIGNAL_INTERVAL", 0), "RDMA send completion signal interval (0 uses SDK defaults)")
-	flag.IntVar(&rdmaOpenParallelism, "rdma-open-parallelism", awsrdmahttp.DefaultOpenParallelism, "max concurrent RDMA open attempts (0 disables limit)")
+	flag.IntVar(&rdmaOpenParallelism, "rdma-open-parallelism", getenvInt("RDMA_OPEN_PARALLELISM", 0), "max concurrent RDMA open attempts (0 disables limit)")
 	flag.DurationVar(&rdmaOpenInterval, "rdma-open-interval", awsrdmahttp.DefaultOpenMinInterval, "minimum interval between RDMA open attempts (0 disables spacing)")
 	flag.IntVar(&clientPoolSize, "client-pool-size", getenvInt("S3_CLIENT_POOL_SIZE", 1), "number of independent s3 clients/transports to spread workload across")
+	flag.IntVar(&retryMaxAttempts, "retry-max-attempts", getenvInt("S3_RETRY_MAX_ATTEMPTS", 3), "max S3 retry attempts per request (>=1)")
+	flag.BoolVar(&enableConnTrace, "conn-trace", getenvBool("CONN_TRACE", false), "enable connection trace counters (adds per-request overhead)")
+	flag.BoolVar(&logEachRequest, "log-each-request", getenvBool("LOG_EACH_REQUEST", false), "log each successful request (adds CPU overhead)")
 	flag.Parse()
 
 	if count < 0 {
@@ -110,16 +190,35 @@ func main() {
 	if clientPoolSize < 1 {
 		log.Fatalf("invalid -client-pool-size %d, must be >= 1", clientPoolSize)
 	}
+	if retryMaxAttempts < 1 {
+		log.Fatalf("invalid -retry-max-attempts %d, must be >= 1", retryMaxAttempts)
+	}
 
 	accessKey, secretKey, sessionToken, err := loadCredentialsFromEnv()
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	var connStats *connTraceStats
+	if enableConnTrace {
+		connStats = &connTraceStats{}
+	}
+	var logConnStatsOnce sync.Once
+	logConnStats := func() {
+		if connStats == nil {
+			return
+		}
+		logConnStatsOnce.Do(func() {
+			connStats.logSummary(enableRDMA)
+		})
+	}
+
 	fail := func(err error) {
+		logConnStats()
 		log.Fatal(err)
 	}
 	failf := func(format string, args ...interface{}) {
+		logConnStats()
 		log.Fatalf(format, args...)
 	}
 
@@ -158,7 +257,7 @@ func main() {
 		return s3.NewFromConfig(cfg, func(o *s3.Options) {
 			o.HTTPClient = httpClient
 			o.UsePathStyle = true
-			o.RetryMaxAttempts = 3
+			o.RetryMaxAttempts = retryMaxAttempts
 			if !enableRDMA {
 				return
 			}
@@ -175,6 +274,19 @@ func main() {
 			rdmaDialer.OpenMinInterval = rdmaOpenInterval
 			rdmaDialer.DisableFallback = disableRDMAFallback
 			rdmaDialer.FallbackDialContext = fallbackDial
+			if connStats != nil && rdmaDialer.Open != nil {
+				baseOpen := rdmaDialer.Open
+				rdmaDialer.Open = func(ctx context.Context, network, address string) (awsrdmahttp.MessageConn, error) {
+					connStats.rdmaOpenCalls.Add(1)
+					conn, err := baseOpen(ctx, network, address)
+					if err != nil {
+						connStats.rdmaOpenFailed.Add(1)
+					} else {
+						connStats.rdmaOpenSuccess.Add(1)
+					}
+					return conn, err
+				}
+			}
 
 			o.EnableRDMATransport = true
 			o.RDMADialer = rdmaDialer
@@ -196,11 +308,11 @@ func main() {
 
 	if enableRDMA {
 		log.Printf(
-			"RDMA transport enabled fallback=%t frame_payload=%d sendq=%d recvq=%d inline=%d low_cpu=%t send_signal_interval=%d open_parallelism=%d open_interval=%s request_timeout=%s count=%d concurrency=%d target_rps=%.2f run_duration=%s client_pool=%d",
-			!disableRDMAFallback, rdmaFramePayload, rdmaSendQueueDepth, rdmaRecvQueueDepth, rdmaInlineThreshold, rdmaLowCPU, rdmaSendSignalIntvl, rdmaOpenParallelism, rdmaOpenInterval, requestTimeout, count, concurrency, targetRPS, runDuration, clientPoolSize,
+			"RDMA transport enabled fallback=%t frame_payload=%d sendq=%d recvq=%d inline=%d low_cpu=%t send_signal_interval=%d open_parallelism=%d open_interval=%s request_timeout=%s retry_max_attempts=%d count=%d concurrency=%d target_rps=%.2f run_duration=%s client_pool=%d conn_trace=%t log_each_request=%t",
+			!disableRDMAFallback, rdmaFramePayload, rdmaSendQueueDepth, rdmaRecvQueueDepth, rdmaInlineThreshold, rdmaLowCPU, rdmaSendSignalIntvl, rdmaOpenParallelism, rdmaOpenInterval, requestTimeout, retryMaxAttempts, count, concurrency, targetRPS, runDuration, clientPoolSize, enableConnTrace, logEachRequest,
 		)
 	} else {
-		log.Printf("RDMA transport disabled; using plain TCP HTTP transport request_timeout=%s count=%d concurrency=%d target_rps=%.2f run_duration=%s client_pool=%d", requestTimeout, count, concurrency, targetRPS, runDuration, clientPoolSize)
+		log.Printf("RDMA transport disabled; using plain TCP HTTP transport request_timeout=%s retry_max_attempts=%d count=%d concurrency=%d target_rps=%.2f run_duration=%s client_pool=%d conn_trace=%t log_each_request=%t", requestTimeout, retryMaxAttempts, count, concurrency, targetRPS, runDuration, clientPoolSize, enableConnTrace, logEachRequest)
 	}
 
 	if autoMkBucket {
@@ -222,7 +334,7 @@ func main() {
 		}, func(worker, i int) error {
 			opCtx, cancel := withOpTimeout(ctx, requestTimeout)
 			defer cancel()
-			return runPut(opCtx, clients[worker%len(clients)], bucket, batchKey(key, i), putFile, payload)
+			return runPut(opCtx, clients[worker%len(clients)], bucket, batchKey(key, i), putFile, payload, connStats, logEachRequest)
 		})
 		if err != nil {
 			fail(err)
@@ -236,7 +348,7 @@ func main() {
 		}, func(worker, i int) error {
 			opCtx, cancel := withOpTimeout(ctx, requestTimeout)
 			defer cancel()
-			return runGet(opCtx, clients[worker%len(clients)], bucket, batchKey(key, i), getOut)
+			return runGet(opCtx, clients[worker%len(clients)], bucket, batchKey(key, i), getOut, connStats, logEachRequest)
 		})
 		if err != nil {
 			fail(err)
@@ -252,14 +364,14 @@ func main() {
 			k := batchKey(key, i)
 
 			opCtxPut, cancelPut := withOpTimeout(ctx, requestTimeout)
-			putErr := runPut(opCtxPut, client, bucket, k, putFile, payload)
+			putErr := runPut(opCtxPut, client, bucket, k, putFile, payload, connStats, logEachRequest)
 			cancelPut()
 			if putErr != nil {
 				return putErr
 			}
 
 			opCtxGet, cancelGet := withOpTimeout(ctx, requestTimeout)
-			getErr := runGet(opCtxGet, client, bucket, k, getOut)
+			getErr := runGet(opCtxGet, client, bucket, k, getOut, connStats, logEachRequest)
 			cancelGet()
 			return getErr
 		})
@@ -269,9 +381,11 @@ func main() {
 	default:
 		failf("invalid -mode %q, expected put|get|both", mode)
 	}
+
+	logConnStats()
 }
 
-func runPut(ctx context.Context, client *s3.Client, bucket, key, putFile, payload string) error {
+func runPut(ctx context.Context, client *s3.Client, bucket, key, putFile, payload string, connStats *connTraceStats, logEachRequest bool) error {
 	body, closer, size, err := openPutBody(putFile, payload)
 	if err != nil {
 		return fmt.Errorf("prepare put body: %w", err)
@@ -289,16 +403,20 @@ func runPut(ctx context.Context, client *s3.Client, bucket, key, putFile, payloa
 		input.ContentLength = &size
 	}
 
+	ctx = withConnTrace(ctx, connStats)
 	_, err = client.PutObject(ctx, input)
 	if err != nil {
 		return fmt.Errorf("PutObject failed: %w", err)
 	}
 
-	log.Printf("PutObject ok bucket=%s key=%s bytes=%d", bucket, key, size)
+	if logEachRequest {
+		log.Printf("PutObject ok bucket=%s key=%s bytes=%d", bucket, key, size)
+	}
 	return nil
 }
 
-func runGet(ctx context.Context, client *s3.Client, bucket, key, outPath string) error {
+func runGet(ctx context.Context, client *s3.Client, bucket, key, outPath string, connStats *connTraceStats, logEachRequest bool) error {
+	ctx = withConnTrace(ctx, connStats)
 	resp, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: &bucket,
 		Key:    &key,
@@ -324,10 +442,12 @@ func runGet(ctx context.Context, client *s3.Client, bucket, key, outPath string)
 		return fmt.Errorf("read object body: %w", err)
 	}
 
-	if outPath != "" {
-		log.Printf("GetObject ok bucket=%s key=%s bytes=%d out=%s", bucket, key, n, outPath)
-	} else {
-		log.Printf("GetObject ok bucket=%s key=%s bytes=%d (stdout)", bucket, key, n)
+	if logEachRequest {
+		if outPath != "" {
+			log.Printf("GetObject ok bucket=%s key=%s bytes=%d out=%s", bucket, key, n, outPath)
+		} else {
+			log.Printf("GetObject ok bucket=%s key=%s bytes=%d (stdout)", bucket, key, n)
+		}
 	}
 	return nil
 }
